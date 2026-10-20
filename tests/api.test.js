@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { aliceResponse, fitAliceText, isSearchIntent, safeHistory } from "../api/index.js";
+import { aliceResponse, fitAliceText, isSearchIntent, isWeatherIntent, safeHistory } from "../api/index.js";
 
 test("Alice response uses required response envelope", () => {
   const result = aliceResponse("Привет", false, [{ role: "user", text: "тест" }]);
@@ -14,6 +14,11 @@ test("search intent detects Russian and English freshness requests", () => {
   assert.equal(isSearchIntent("Какая погода сегодня?"), true);
   assert.equal(isSearchIntent("What is the latest news?"), true);
   assert.equal(isSearchIntent("Расскажи сказку"), false);
+});
+
+test("weather intent detects a question about current weather", () => {
+  assert.equal(isWeatherIntent("Какая сейчас погода в Смоленске?"), true);
+  assert.equal(isWeatherIntent("Сколько будет два плюс два?"), false);
 });
 
 test("long responses are cut at a natural boundary and stay within Alice limit", () => {
@@ -59,5 +64,42 @@ test("launch request returns a valid Alice greeting without external API keys", 
   assert.equal(statusCode, 200);
   assert.equal(payload.version, "1.0");
   assert.match(payload.response.text, /Привет/);
+  assert.equal(payload.response.end_session, false);
+});
+
+test("weather question uses current forecast and answers without Gemini", async () => {
+  const handler = (await import("../api/index.js")).default;
+  const originalFetch = globalThis.fetch;
+  const requestedUrls = [];
+  globalThis.fetch = async url => {
+    requestedUrls.push(String(url));
+    if (requestedUrls.length === 1) {
+      return { ok: true, json: async () => ({ results: [{ name: "Смоленск", latitude: 54.78, longitude: 32.05 }] }) };
+    }
+    return { ok: true, json: async () => ({ current: { temperature_2m: 4.4, weather_code: 3 } }) };
+  };
+  let payload;
+  const res = {
+    status() { return this; },
+    json(value) { payload = value; return value; }
+  };
+  try {
+    await handler({
+      method: "POST",
+      body: {
+        request: {
+          command: "какая сейчас погода в смоленске",
+          nlu: { entities: [{ type: "YANDEX.GEO", value: { city: "смоленск" } }] }
+        },
+        state: { session: { history: [] } }
+      }
+    }, res);
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+  assert.equal(requestedUrls.length, 2);
+  assert.match(requestedUrls[0], /geocoding-api\.open-meteo\.com/);
+  assert.match(requestedUrls[1], /api\.open-meteo\.com/);
+  assert.match(payload.response.text, /Смоленск.*облачно.*4 градусов/);
   assert.equal(payload.response.end_session, false);
 });

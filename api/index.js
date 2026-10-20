@@ -5,6 +5,7 @@ const MAX_ALICE_TEXT = 1024;
 const TOTAL_RESPONSE_BUDGET_MS = 3600;
 const SERPER_TIMEOUT_MS = 600;
 const GEMINI_TIMEOUT_MS = 2500;
+const WEATHER_TIMEOUT_MS = 1200;
 
 const SYSTEM_PROMPT = [
   "Ты — полезный голосовой помощник в навыке Яндекс Алисы.",
@@ -47,6 +48,57 @@ function fitAliceText(value) {
 
 function isSearchIntent(text) {
   return /\b(latest|today|current|news|weather|price|exchange rate|recent|search|look up)\b|сегодня|сейчас|последн|новост|погод|курс валют|найди|поищи|актуальн|сколько стоит|свежие данные/i.test(text);
+}
+
+function isWeatherIntent(text) {
+  return /\bweather\b|погод/i.test(text);
+}
+
+function weatherCity(request) {
+  const entities = request?.nlu?.entities;
+  if (!Array.isArray(entities)) return "";
+  const city = entities.find(entity => entity?.type === "YANDEX.GEO")?.value?.city;
+  return typeof city === "string" ? city.trim().slice(0, 100) : "";
+}
+
+function weatherDescription(code) {
+  if (code <= 1) return "ясно";
+  if (code === 2) return "переменная облачность";
+  if (code === 3) return "облачно";
+  if (code === 45 || code === 48) return "туман";
+  if (code >= 51 && code <= 57) return "морось";
+  if (code >= 61 && code <= 67) return "дождь";
+  if (code >= 71 && code <= 77) return "снег";
+  if (code >= 80 && code <= 82) return "ливень";
+  if (code >= 85 && code <= 86) return "снегопад";
+  if (code >= 95 && code <= 99) return "гроза";
+  return "погодные условия уточняются";
+}
+
+async function currentWeather(city, remainingMs) {
+  const geocodingUrl = new URL("https://geocoding-api.open-meteo.com/v1/search");
+  geocodingUrl.searchParams.set("name", city);
+  geocodingUrl.searchParams.set("count", "1");
+  geocodingUrl.searchParams.set("language", "ru");
+  const geocoding = await fetchJson(geocodingUrl, {}, Math.min(WEATHER_TIMEOUT_MS, remainingMs()));
+  const place = geocoding.response.ok && Array.isArray(geocoding.data.results)
+    ? geocoding.data.results[0] : null;
+  if (!place || !Number.isFinite(place.latitude) || !Number.isFinite(place.longitude)) {
+    throw new Error("WEATHER_CITY_NOT_FOUND");
+  }
+
+  const forecastUrl = new URL("https://api.open-meteo.com/v1/forecast");
+  forecastUrl.searchParams.set("latitude", String(place.latitude));
+  forecastUrl.searchParams.set("longitude", String(place.longitude));
+  forecastUrl.searchParams.set("current", "temperature_2m,weather_code");
+  forecastUrl.searchParams.set("timezone", "auto");
+  const forecast = await fetchJson(forecastUrl, {}, Math.min(WEATHER_TIMEOUT_MS, remainingMs()));
+  const temperature = forecast.data?.current?.temperature_2m;
+  const code = forecast.data?.current?.weather_code;
+  if (!forecast.response.ok || !Number.isFinite(temperature) || !Number.isFinite(code)) {
+    throw new Error("WEATHER_DATA_UNAVAILABLE");
+  }
+  return `${place.name}: сейчас ${weatherDescription(code)}, температура ${Math.round(temperature)} градусов Цельсия. Данные Open-Meteo.`;
 }
 
 function safeHistory(history) {
@@ -219,6 +271,26 @@ export default async function handler(req, res) {
   }
 
   try {
+    if (isWeatherIntent(text)) {
+      const city = weatherCity(body.request);
+      if (!city) {
+        return res.status(200).json(aliceResponse("Назовите город, для которого нужна погода.", false, oldHistory));
+      }
+      let answer;
+      try {
+        answer = await currentWeather(city, () => Math.max(100, remainingMs() - 600));
+      } catch (error) {
+        console.warn("Weather request failed:", error?.message || "unknown error");
+        answer = "Не удалось получить данные о погоде. Попробуйте спросить ещё раз.";
+      }
+      const history = [
+        ...oldHistory,
+        { role: "user", text: text.slice(0, MAX_HISTORY_MESSAGE_CHARS) },
+        { role: "model", text: answer.slice(0, MAX_HISTORY_MESSAGE_CHARS) }
+      ].slice(-MAX_HISTORY_MESSAGES);
+      return res.status(200).json(aliceResponse(answer, false, history));
+    }
+
     let searchContext = "";
     if (isSearchIntent(text) && process.env.SERPER_API_KEY) {
       // Search has a very short budget because Alice expects a response within 4.5 seconds.
@@ -246,4 +318,4 @@ export default async function handler(req, res) {
   }
 }
 
-export { aliceResponse, fitAliceText, isSearchIntent, safeHistory };
+export { aliceResponse, fitAliceText, isSearchIntent, isWeatherIntent, safeHistory, weatherCity, weatherDescription };
