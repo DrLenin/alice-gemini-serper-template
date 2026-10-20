@@ -103,3 +103,126 @@ test("weather question uses current forecast and answers without Gemini", async 
   assert.match(payload.response.text, /Смоленск.*облачно.*4 градусов/);
   assert.equal(payload.response.end_session, false);
 });
+
+test("fresh news request does not ask Gemini to invent news without search", async () => {
+  const handler = (await import("../api/index.js")).default;
+  const originalKey = process.env.SERPER_API_KEY;
+  const originalFetch = globalThis.fetch;
+  delete process.env.SERPER_API_KEY;
+  globalThis.fetch = () => { throw new Error("Unexpected external request"); };
+  let payload;
+  try {
+    await handler({ method: "POST", body: { request: { command: "какие новости в смоленске сегодня" } } }, {
+      status() { return this; },
+      json(value) { payload = value; return value; }
+    });
+  } finally {
+    globalThis.fetch = originalFetch;
+    if (originalKey === undefined) delete process.env.SERPER_API_KEY;
+    else process.env.SERPER_API_KEY = originalKey;
+  }
+  assert.match(payload.response.text, /Не удалось получить свежие результаты поиска/);
+});
+
+test("fresh news request passes Serper results to Gemini", async () => {
+  const handler = (await import("../api/index.js")).default;
+  const originalFetch = globalThis.fetch;
+  const originalSearchKey = process.env.SERPER_API_KEY;
+  const originalGeminiKey = process.env.GEMINI_API_KEY;
+  process.env.SERPER_API_KEY = "test-serper-key";
+  process.env.GEMINI_API_KEY = "test-gemini-key";
+  const requests = [];
+  globalThis.fetch = async (url, options) => {
+    requests.push({ url: String(url), options });
+    if (requests.length === 1) return {
+      ok: true,
+      json: async () => ({ news: [{ title: "Новость Смоленска", snippet: "Открыли новый парк", date: "20 октября", source: "Тестовое СМИ", link: "https://example.org/news" }] })
+    };
+    return { ok: true, json: async () => ({ candidates: [{ content: { parts: [{ text: "В Смоленске открыли новый парк." }] } }] }) };
+  };
+  let payload;
+  try {
+    await handler({ method: "POST", body: { request: { command: "какие новости в смоленске сегодня" } } }, {
+      status() { return this; },
+      json(value) { payload = value; return value; }
+    });
+  } finally {
+    globalThis.fetch = originalFetch;
+    if (originalSearchKey === undefined) delete process.env.SERPER_API_KEY;
+    else process.env.SERPER_API_KEY = originalSearchKey;
+    if (originalGeminiKey === undefined) delete process.env.GEMINI_API_KEY;
+    else process.env.GEMINI_API_KEY = originalGeminiKey;
+  }
+  assert.match(requests[0].url, /google\.serper\.dev\/news/);
+  assert.equal(JSON.parse(requests[0].options.body).tbs, "qdr:d");
+  assert.match(requests[1].url, /generativelanguage\.googleapis\.com/);
+  assert.match(JSON.parse(requests[1].options.body).contents.at(-1).parts[0].text, /Открыли новый парк/);
+  assert.equal(payload.response.text, "В Смоленске открыли новый парк.");
+});
+
+test("fresh news request speaks a search result if Gemini fails", async () => {
+  const handler = (await import("../api/index.js")).default;
+  const originalFetch = globalThis.fetch;
+  const originalSearchKey = process.env.SERPER_API_KEY;
+  const originalGeminiKey = process.env.GEMINI_API_KEY;
+  process.env.SERPER_API_KEY = "test-serper-key";
+  process.env.GEMINI_API_KEY = "test-gemini-key";
+  let requestCount = 0;
+  globalThis.fetch = async () => {
+    requestCount += 1;
+    if (requestCount === 1) return {
+      ok: true,
+      json: async () => ({ news: [{ title: "Новость Смоленска", snippet: "Открыли новый парк", date: "20 октября" }] })
+    };
+    throw new Error("Gemini unavailable");
+  };
+  let payload;
+  try {
+    await handler({ method: "POST", body: { request: { command: "какие новости в смоленске сегодня" } } }, {
+      status() { return this; },
+      json(value) { payload = value; return value; }
+    });
+  } finally {
+    globalThis.fetch = originalFetch;
+    if (originalSearchKey === undefined) delete process.env.SERPER_API_KEY;
+    else process.env.SERPER_API_KEY = originalSearchKey;
+    if (originalGeminiKey === undefined) delete process.env.GEMINI_API_KEY;
+    else process.env.GEMINI_API_KEY = originalGeminiKey;
+  }
+  assert.equal(requestCount, 2);
+  assert.match(payload.response.text, /По результатам поиска: Новость Смоленска.*Открыли новый парк/);
+});
+
+test("other fresh requests use web search results", async () => {
+  const handler = (await import("../api/index.js")).default;
+  const originalFetch = globalThis.fetch;
+  const originalSearchKey = process.env.SERPER_API_KEY;
+  const originalGeminiKey = process.env.GEMINI_API_KEY;
+  process.env.SERPER_API_KEY = "test-serper-key";
+  process.env.GEMINI_API_KEY = "test-gemini-key";
+  const requests = [];
+  globalThis.fetch = async (url, options) => {
+    requests.push({ url: String(url), options });
+    if (requests.length === 1) return {
+      ok: true,
+      json: async () => ({ organic: [{ title: "Курсы валют", snippet: "Курс найден", link: "https://example.org/rates" }] })
+    };
+    return { ok: true, json: async () => ({ candidates: [{ content: { parts: [{ text: "Курс найден в интернете." }] } }] }) };
+  };
+  let payload;
+  try {
+    await handler({ method: "POST", body: { request: { command: "какой курс валют сегодня" } } }, {
+      status() { return this; },
+      json(value) { payload = value; return value; }
+    });
+  } finally {
+    globalThis.fetch = originalFetch;
+    if (originalSearchKey === undefined) delete process.env.SERPER_API_KEY;
+    else process.env.SERPER_API_KEY = originalSearchKey;
+    if (originalGeminiKey === undefined) delete process.env.GEMINI_API_KEY;
+    else process.env.GEMINI_API_KEY = originalGeminiKey;
+  }
+  assert.match(requests[0].url, /google\.serper\.dev\/search/);
+  assert.match(JSON.parse(requests[1].options.body).contents.at(-1).parts[0].text, /Курс найден/);
+  assert.equal(payload.response.text, "Курс найден в интернете.");
+});
